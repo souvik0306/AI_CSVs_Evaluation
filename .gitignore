@@ -1,0 +1,16 @@
+# This project is nested inside Dataset_preparation_Airimu, whose ignore rules
+# exclude datasets, generated plots, logs, archives, caches, and editor files.
+# Keep this standalone repository source-only by ignoring everything first and
+# allowing back only its documentation and active scripts.
+*
+
+# Git needs to traverse directories to find the allowed files below.
+!*/
+
+!.gitignore
+!*.md
+
+!/scripts/
+!/scripts/**/*.py
+!/scripts/**/*.sh
+!/scripts/**/*.ipynb
