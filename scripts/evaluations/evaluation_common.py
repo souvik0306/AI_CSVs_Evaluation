@@ -1,501 +1,340 @@
 #!/usr/bin/env python3
-"""Shared evaluation flow using the existing velocity pipeline implementations."""
+"""Shared evaluation for pre-cleaned, timestamp-aligned velocity CSVs."""
+
 import argparse
-import importlib.util
-import re
-import subprocess
-import sys
+import csv
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SCRIPT_DIR = REPO_ROOT
-PIPELINE_DIR = REPO_ROOT / "scripts" / "pipeline"
-DEFAULT_VELOCITY_BOUNDS = ["vel_*:-8:8"]
-DEFAULT_EST_TOPIC = "/mavros/local_position/velocity_local"
-DEFAULT_GT_TOPIC = "/vrpn_client_node/AIIMU1/twist"
-HOVER_SPEED_THRESHOLD_MPS = 0.1
+
+REQUIRED_VELOCITY_COLUMNS = ["time", "vel_x", "vel_y", "vel_z"]
+
+Window = Tuple[str, float, float]
+Windows = Mapping[str, Window]
+
+SUMMARY_FIELDS = [
+    "mode",
+    "flight",
+    "label",
+    "window_start_s",
+    "window_end_s",
+    "rows",
+    "actual_duration_s",
+    "rmse_x",
+    "rmse_y",
+    "rmse_z",
+    "rmse_xy",
+    "rmse_x_bias_corrected",
+    "rmse_y_bias_corrected",
+    "rmse_z_bias_corrected",
+    "rmse_xy_bias_corrected",
+    "drift_rate_mps2",
+    "drift_intercept_mps",
+    "out_dir",
+]
 
 
-def _load_pipeline(filename: str, module_name: str):
-    spec = importlib.util.spec_from_file_location(module_name, PIPELINE_DIR / filename)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load {filename}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def parse_evaluation_args(
+    description: str,
+    results_root: Path,
+    gt_root: Path,
+    run_name: str,
+    modes: Sequence[str],
+    default_mode: Optional[str] = None,
+) -> argparse.Namespace:
+    """Create the common CLI used by dataset-specific evaluation scripts."""
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument(
+        "--results-root",
+        type=Path,
+        default=results_root,
+        help="Directory containing mode folders with flight velocity CSVs.",
+    )
+    parser.add_argument(
+        "--gt-root",
+        type=Path,
+        default=gt_root,
+        help="Directory containing mode/flight_*/data.csv GT files.",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=run_name,
+        help="Output folder name to create inside each evaluated mode folder.",
+    )
+    parser.add_argument(
+        "--window-duration",
+        type=float,
+        default=None,
+        help="Override each configured window end with start + duration.",
+    )
+    if len(modes) > 1:
+        parser.add_argument(
+            "--mode",
+            choices=[*modes, "ALL"],
+            default=default_mode or modes[0],
+            help="Mode to evaluate, or ALL to evaluate every configured mode.",
+        )
+    else:
+        parser.set_defaults(mode=modes[0])
+    args = parser.parse_args()
+    if args.mode not in {*modes, "ALL"}:
+        parser.error(f"default mode {args.mode!r} is not configured")
+    return args
 
 
-CONVERTER = _load_pipeline("1_rosbag_to_csv_vel.py", "velocity_converter")
-CLEANER = _load_pipeline("3_vel_csv_dataset_cleaner.py", "velocity_cleaner")
-METRICS = _load_pipeline("6_bias_zeroing_and_rmse.py", "velocity_metrics")
-
-def extract_bag_velocities(
-	bag_path: Path,
-	est_path: Path,
-	gt_path: Path,
-	est_topic: str,
-	gt_topic: str,
-) -> Tuple[int, int, float]:
-	est_rows = []
-	gt_rows = []
-	with CONVERTER.rosbag.Bag(str(bag_path), "r") as bag:
-		for topic, message, _bag_stamp in bag.read_messages(topics=[est_topic, gt_topic]):
-			header_time = CONVERTER.header_time_to_sec(message)
-			row = CONVERTER.twist_message_to_row(header_time, message)
-			if topic == est_topic:
-				est_rows.append(row)
-			else:
-				gt_rows.append(row)
-
-	if not est_rows:
-		raise ValueError(f"No estimate messages found on {est_topic} in {bag_path}")
-	if not gt_rows:
-		raise ValueError(f"No GT messages found on {gt_topic} in {bag_path}")
-
-	est_path.parent.mkdir(parents=True, exist_ok=True)
-	CONVERTER.build_velocity_dataframe(est_rows).sort_values("time").to_csv(est_path, index=False)
-	CONVERTER.build_velocity_dataframe(gt_rows).sort_values("time").to_csv(gt_path, index=False)
-	flight_time_zero = min(est_rows[0]["time"], gt_rows[0]["time"])
-	return len(est_rows), len(gt_rows), flight_time_zero
+def with_duration(windows: Windows, duration: Optional[float]) -> Dict[str, Window]:
+    if duration is None:
+        return dict(windows)
+    if duration <= 0:
+        raise ValueError("window duration must be greater than zero")
+    return {
+        flight: (label, start, start + duration)
+        for flight, (label, start, _end) in windows.items()
+    }
 
 
-def clean_velocity_csv(
-	input_path: Path,
-	output_path: Path,
-	window: int,
-	median_tol: Optional[float],
-	bound_overrides: List[Tuple[str, Optional[float], Optional[float]]],
-	fill: str,
-	savgol_window: Optional[int],
-	savgol_polyorder: int,
-) -> Tuple[Dict[str, int], Dict[str, int]]:
-	df = pd.read_csv(input_path)
-	cleaned, pruned, filtered = CLEANER.clean_dataframe(
-		df,
-		window,
-		median_tol,
-		bound_overrides,
-		fill,
-		savgol_window=savgol_window,
-		savgol_polyorder=savgol_polyorder,
-	)
-	output_path.parent.mkdir(parents=True, exist_ok=True)
-	cleaned.to_csv(output_path, index=False)
-	return pruned, filtered
+def load_velocity_csv(path: Path) -> pd.DataFrame:
+    """Load one already-clean velocity CSV and validate its data contract."""
+    if not path.exists():
+        raise FileNotFoundError(path)
+    frame = pd.read_csv(path)
+    missing = [column for column in REQUIRED_VELOCITY_COLUMNS if column not in frame]
+    if missing:
+        raise ValueError(f"Missing columns {missing} in {path}")
+
+    frame = frame.copy()
+    for column in REQUIRED_VELOCITY_COLUMNS:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    invalid = ~np.isfinite(frame[REQUIRED_VELOCITY_COLUMNS].to_numpy(dtype=float))
+    if invalid.any():
+        raise ValueError(f"Non-finite velocity data found in {path}")
+    return frame.sort_values("time").reset_index(drop=True)
 
 
-def load_velocity_csv(path: Path, required_columns: Iterable[str]) -> pd.DataFrame:
-	df = pd.read_csv(path)
-	missing = [column for column in required_columns if column not in df.columns]
-	if missing:
-		raise ValueError(f"Missing columns {missing} in {path}")
-	df = df.copy()
-	for column in required_columns:
-		df[column] = pd.to_numeric(df[column], errors="coerce")
-	df = df.dropna(subset=required_columns).sort_values("time").reset_index(drop=True)
-	if df.empty:
-		raise ValueError(f"No valid rows in {path}")
-	return df
+def load_aligned_pair(est_path: Path, gt_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Load estimate/GT data and require their existing timestamps to match."""
+    estimate = load_velocity_csv(est_path)
+    ground_truth = load_velocity_csv(gt_path)
+    if len(estimate) != len(ground_truth) or not np.array_equal(
+        estimate["time"].to_numpy(), ground_truth["time"].to_numpy()
+    ):
+        raise ValueError(
+            "Estimate and GT timestamps are not already aligned: "
+            f"{est_path} ({len(estimate)} rows), {gt_path} ({len(ground_truth)} rows)"
+        )
+    return estimate, ground_truth
 
 
-def align_ground_truth(
-	est_clean_path: Path,
-	gt_clean_path: Path,
-	output_path: Path,
-	gt_latency: float,
-	tolerance: Optional[float],
-) -> Path:
-	est_df = load_velocity_csv(est_clean_path, ["time"])
-	gt_df = load_velocity_csv(gt_clean_path, ["time"])
-	if gt_latency:
-		gt_df = gt_df.copy()
-		gt_df["time"] = gt_df["time"] - gt_latency
-		gt_df = gt_df.sort_values("time").reset_index(drop=True)
-
-	merge_args = {"on": "time", "direction": "nearest", "suffixes": ("_est", "_gt")}
-	if tolerance is not None:
-		merge_args["tolerance"] = tolerance
-	aligned = pd.merge_asof(est_df, gt_df, **merge_args)
-
-	gt_columns = []
-	rename = {}
-	for column in gt_df.columns:
-		if column in aligned.columns:
-			gt_columns.append(column)
-		elif f"{column}_gt" in aligned.columns:
-			gt_columns.append(f"{column}_gt")
-			rename[f"{column}_gt"] = column
-	aligned[gt_columns].rename(columns=rename).to_csv(output_path, index=False)
-	return output_path
+def clip_aligned_pair(
+    estimate: pd.DataFrame,
+    ground_truth: pd.DataFrame,
+    window_start: float,
+    window_end: float,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Select a flight-relative window from an aligned dataframe pair."""
+    if window_start < 0 or window_end <= window_start:
+        raise ValueError(f"Invalid window: {window_start} -> {window_end}")
+    flight_time_zero = float(ground_truth["time"].iloc[0])
+    absolute_start = flight_time_zero + window_start
+    absolute_end = flight_time_zero + window_end
+    mask = estimate["time"].between(absolute_start, absolute_end)
+    estimate_window = estimate.loc[mask].copy().reset_index(drop=True)
+    ground_truth_window = ground_truth.loc[mask].copy().reset_index(drop=True)
+    if estimate_window.empty:
+        raise ValueError(f"No samples in window {window_start} -> {window_end} seconds")
+    return estimate_window, ground_truth_window
 
 
-def clip_window(
-	est_clean_path: Path,
-	gt_aligned_path: Path,
-	start_s: float,
-	duration_s: int,
-	output_dir: Path,
-	flight_name: str,
-	flight_time_zero: Optional[float] = None,
-) -> Tuple[Path, Path]:
-	est_df = load_velocity_csv(est_clean_path, ["time"])
-	gt_df = load_velocity_csv(gt_aligned_path, ["time"])
-	reference_time = (
-		float(gt_df["time"].iloc[0])
-		if flight_time_zero is None
-		else float(flight_time_zero)
-	)
-	start_time = reference_time + start_s
-	end_time = start_time + duration_s
-	est_window = est_df[est_df["time"].between(start_time, end_time)].copy()
-	gt_window = gt_df[gt_df["time"].between(start_time, end_time)].copy()
-	if est_window.empty or gt_window.empty:
-		raise ValueError(
-			f"Empty {duration_s}s window for {flight_name}: "
-			f"estimate rows={len(est_window)}, GT rows={len(gt_window)}"
-		)
-
-	output_dir.mkdir(parents=True, exist_ok=True)
-	est_out = output_dir / f"{flight_name}_vel_est_clean_{duration_s}s_window.csv"
-	gt_out = output_dir / f"{flight_name}_vel_gt_clean_aligned_{duration_s}s_window.csv"
-	est_window.to_csv(est_out, index=False)
-	gt_window.to_csv(gt_out, index=False)
-	return est_out, gt_out
+def _rmse(values: pd.Series) -> float:
+    array = values.to_numpy(dtype=float)
+    return float(np.sqrt(np.mean(array**2)))
 
 
-def evaluate_window(
-	est_window_path: Path,
-	gt_window_path: Path,
-	flight_name: str,
-	start_s: float,
-	duration_s: int,
-	plot_dpi: int,
-	flight_time_zero: float,
-	hover_analysis: bool = False,
-) -> Dict[str, object]:
-	rmse_metrics, bias_path, rmse_summary_path = calculate_rmse(
-		est_window_path, gt_window_path, est_window_path.parent
-	)
-	hover_regime_metrics = {}
-	if hover_analysis:
-		hover_regime_metrics = calculate_hover_regime_rmse(bias_path, gt_window_path)
-	drift_rate, drift_intercept, plots_dir = calculate_drift_and_plots(
-		bias_path=bias_path,
-		est_window_path=est_window_path,
-		gt_window_path=gt_window_path,
-		plot_dpi=plot_dpi,
-		flight_time_zero=flight_time_zero,
-		plot_hover_horizontal_diagnostic=hover_analysis,
-	)
-	bias_df = pd.read_csv(bias_path)
-	sample_start_s = float(bias_df["time"].iloc[0]) - flight_time_zero
-	sample_end_s = float(bias_df["time"].iloc[-1]) - flight_time_zero
-
-	return {
-		"flight": flight_name,
-		"configured_window_start_s": start_s,
-		"configured_window_end_s": start_s + duration_s,
-		"configured_window_duration_s": duration_s,
-		"sampled_window_start_s": sample_start_s,
-		"sampled_window_end_s": sample_end_s,
-		"sampled_window_duration_s": sample_end_s - sample_start_s,
-		"samples": int(len(bias_df)),
-		**rmse_metrics,
-		**hover_regime_metrics,
-		"drift_rate_mps2": drift_rate,
-		"drift_intercept_mps": drift_intercept,
-		"rmse_summary_file": str(rmse_summary_path),
-		"bias_errors_file": str(bias_path),
-		"drift_plots_dir": str(plots_dir),
-	}
+def _rmse_xy(err_x: pd.Series, err_y: pd.Series) -> float:
+    x = err_x.to_numpy(dtype=float)
+    y = err_y.to_numpy(dtype=float)
+    return float(np.sqrt(np.mean(x**2 + y**2)))
 
 
-def summarize_duration(rows: List[Dict[str, object]]) -> Dict[str, object]:
-	df = pd.DataFrame(rows)
-	metric_columns = [
-		"rmse_x_mps",
-		"rmse_y_mps",
-		"rmse_z_mps",
-		"rmse_xy_mps",
-		"bias_corrected_rmse_x_mps",
-		"bias_corrected_rmse_y_mps",
-		"bias_corrected_rmse_z_mps",
-		"bias_corrected_rmse_xy_mps",
-		"bias_corrected_rmse_xy_stationary_mps",
-		"bias_corrected_rmse_xy_moving_mps",
-		"drift_rate_mps2",
-		"drift_intercept_mps",
-	]
-	result: Dict[str, object] = {
-		"trajectories": len(rows),
-		"total_samples": int(df["samples"].sum()),
-	}
-	for column in metric_columns:
-		if column not in df.columns:
-			continue
-		result[f"mean_{column}"] = float(pd.to_numeric(df[column], errors="coerce").mean())
-	for column in ("stationary_samples", "moving_samples"):
-		if column in df.columns:
-			result[f"total_{column}"] = int(pd.to_numeric(df[column], errors="coerce").sum())
-	return result
+def calculate_errors(
+    estimate: pd.DataFrame,
+    ground_truth: pd.DataFrame,
+) -> pd.DataFrame:
+    """Calculate raw and first-sample bias-corrected velocity errors."""
+    errors = pd.DataFrame({"time": estimate["time"]})
+    for axis in "xyz":
+        errors[f"err_{axis}"] = (
+            estimate[f"vel_{axis}"].to_numpy(dtype=float)
+            - ground_truth[f"vel_{axis}"].to_numpy(dtype=float)
+        )
+        errors[f"err_{axis}_bias"] = (
+            errors[f"err_{axis}"] - float(errors[f"err_{axis}"].iloc[0])
+        )
+    return errors
 
 
-def calculate_rmse(est_window_path: Path, gt_window_path: Path, output_dir: Path):
-    """Calculate the same first-sample bias and RMSE as pipeline script 6."""
-    est = METRICS._load_velocity_csv(est_window_path)
-    gt = METRICS._load_velocity_csv(gt_window_path)
-    merged = pd.merge(est, gt, on="time", how="inner", suffixes=("_est", "_gt"))
-    if merged.empty:
-        raise ValueError("No overlapping timestamps between estimate and GT CSVs")
-    merged = METRICS._compute_bias_errors(merged)
-    raw = {axis: METRICS._rmse(merged[f"err_{axis}"]) for axis in "xyz"}
-    raw["xy"] = METRICS._rmse_xy(merged["err_x"], merged["err_y"])
-    corrected = {axis: METRICS._rmse(merged[f"err_{axis}_bias"]) for axis in "xyz"}
-    corrected["xy"] = METRICS._rmse_xy(merged["err_x_bias"], merged["err_y_bias"])
-    bias_path = output_dir / f"{est_window_path.stem}_bias_errors.csv"
-    summary_path = output_dir / f"{est_window_path.stem}_rmse_summary.txt"
-    columns = ["time", "err_x", "err_y", "err_z", "err_x_bias", "err_y_bias", "err_z_bias"]
-    merged[columns].to_csv(bias_path, index=False)
-    lines = ["RMSE (Not including bias): ", "", *[f"RMSE_{axis}={raw[axis]:.6f}" for axis in ("x", "y", "z", "xy")],
-             "", "RMSE (bias corrected):", "", *[f"RMSE_{axis}={corrected[axis]:.6f}" for axis in ("x", "y", "z", "xy")]]
-    summary_path.write_text("\n".join(lines) + "\n")
-    values = {f"rmse_{axis}_mps": round(raw[axis], 6) for axis in ("x", "y", "z", "xy")}
-    values.update({f"bias_corrected_rmse_{axis}_mps": round(corrected[axis], 6) for axis in ("x", "y", "z", "xy")})
-    return values, bias_path, summary_path
+def calculate_metrics(errors: pd.DataFrame) -> Dict[str, float]:
+    """Calculate RMSE and the linear drift fit of horizontal raw error."""
+    metrics = {
+        "rmse_x": _rmse(errors["err_x"]),
+        "rmse_y": _rmse(errors["err_y"]),
+        "rmse_z": _rmse(errors["err_z"]),
+        "rmse_xy": _rmse_xy(errors["err_x"], errors["err_y"]),
+        "rmse_x_bias_corrected": _rmse(errors["err_x_bias"]),
+        "rmse_y_bias_corrected": _rmse(errors["err_y_bias"]),
+        "rmse_z_bias_corrected": _rmse(errors["err_z_bias"]),
+        "rmse_xy_bias_corrected": _rmse_xy(
+            errors["err_x_bias"], errors["err_y_bias"]
+        ),
+    }
+    relative_time = errors["time"].to_numpy(dtype=float) - float(errors["time"].iloc[0])
+    xy_error = np.hypot(
+        errors["err_x"].to_numpy(dtype=float),
+        errors["err_y"].to_numpy(dtype=float),
+    )
+    if len(errors) >= 2:
+        drift_rate, drift_intercept = np.polyfit(relative_time, xy_error, 1)
+    else:
+        drift_rate, drift_intercept = float("nan"), float("nan")
+    metrics["drift_rate_mps2"] = float(drift_rate)
+    metrics["drift_intercept_mps"] = float(drift_intercept)
+    return metrics
 
 
-def calculate_hover_regime_rmse(
-	bias_path: Path,
-	gt_window_path: Path,
-	threshold_mps: float = HOVER_SPEED_THRESHOLD_MPS,
-) -> Dict[str, object]:
-	"""Calculate bias-corrected horizontal RMSE above and below the hover threshold."""
-	errors = load_velocity_csv(
-		bias_path,
-		["time", "err_x_bias", "err_y_bias"],
-	)
-	gt = load_velocity_csv(gt_window_path, ["time", "vel_x", "vel_y"])
-	merged = pd.merge(errors, gt, on="time", how="inner")
-	if merged.empty:
-		raise ValueError("No overlapping timestamps between bias errors and GT CSVs")
-
-	gt_xy = np.hypot(
-		merged["vel_x"].to_numpy(dtype=float),
-		merged["vel_y"].to_numpy(dtype=float),
-	)
-	squared_xy_error = (
-		merged["err_x_bias"].to_numpy(dtype=float) ** 2
-		+ merged["err_y_bias"].to_numpy(dtype=float) ** 2
-	)
-	stationary = gt_xy < threshold_mps
-	moving = ~stationary
-
-	def regime_rmse(mask: np.ndarray) -> float:
-		if not mask.any():
-			return float("nan")
-		return float(np.sqrt(np.mean(squared_xy_error[mask])))
-
-	return {
-		"stationary_samples": int(stationary.sum()),
-		"moving_samples": int(moving.sum()),
-		"bias_corrected_rmse_xy_stationary_mps": round(regime_rmse(stationary), 6),
-		"bias_corrected_rmse_xy_moving_mps": round(regime_rmse(moving), 6),
-	}
-
-
-def calculate_drift_and_plots(bias_path: Path, est_window_path: Path, gt_window_path: Path,
-                              plot_dpi: int, flight_time_zero: float,
-                              plot_hover_horizontal_diagnostic: bool = False):
-    """Run the existing report script and return its drift rate and plots."""
-    plots_dir = bias_path.parent / "plots" / bias_path.stem.replace("_bias_errors", "")
-    command = [
-        sys.executable, str(PIPELINE_DIR / "7_plot_absolute_velocity_error.py"),
-        "--bias_errors_csv", str(bias_path),
-        "--est_csv", str(est_window_path),
-        "--gt_csv", str(gt_window_path),
-        "--out_dir", str(plots_dir),
-        "--dpi", str(plot_dpi),
-        "--flight_time_zero", f"{flight_time_zero:.9f}",
+def write_rmse_summary(path: Path, metrics: Mapping[str, float]) -> None:
+    lines = [
+        "RMSE (Not including bias):",
+        *(f"RMSE_{axis}={metrics[f'rmse_{axis}']:.6f}" for axis in ("x", "y", "z", "xy")),
+        "",
+        "RMSE (bias corrected):",
+        *(
+            f"RMSE_{axis}={metrics[f'rmse_{axis}_bias_corrected']:.6f}"
+            for axis in ("x", "y", "z", "xy")
+        ),
+        "",
+        f"Drift Rate={metrics['drift_rate_mps2']:.9f} m/s^2",
+        f"Drift Intercept={metrics['drift_intercept_mps']:.9f} m/s",
     ]
-    if plot_hover_horizontal_diagnostic:
-        command.append("--plot_hover_horizontal_diagnostic")
-    completed = subprocess.run(command, text=True, capture_output=True)
-    if completed.returncode != 0:
-        raise RuntimeError(f"Report failed for {bias_path}:\n{completed.stdout}{completed.stderr}")
-    rate = re.search(r"^Drift Rate:\s+([0-9eE+.-]+)\s+m/s\^2$", completed.stdout, re.MULTILINE)
-    intercept = re.search(r"^Drift Intercept:\s+([0-9eE+.-]+)\s+m/s$", completed.stdout, re.MULTILINE)
-    if not rate or not intercept:
-        raise ValueError(f"Could not read drift metrics from report output for {bias_path}")
-    return float(rate.group(1)), float(intercept.group(1)), plots_dir
+    path.write_text("\n".join(lines) + "\n")
 
 
-def resolve_path(value: str) -> Path:
-	path = Path(value)
-	return path if path.is_absolute() else SCRIPT_DIR / path
+def evaluate_flight(
+    mode: str,
+    flight: str,
+    label: str,
+    window_start: float,
+    window_end: float,
+    est_path: Path,
+    gt_path: Path,
+    out_dir: Path,
+) -> Dict[str, object]:
+    estimate, ground_truth = load_aligned_pair(est_path, gt_path)
+    estimate, ground_truth = clip_aligned_pair(
+        estimate, ground_truth, window_start, window_end
+    )
+    errors = calculate_errors(estimate, ground_truth)
+    metrics = calculate_metrics(errors)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    estimate_path = out_dir / f"{flight}_velocity_window.csv"
+    ground_truth_path = out_dir / "data_window.csv"
+    errors_path = out_dir / f"{flight}_velocity_window_bias_errors.csv"
+    rmse_path = out_dir / f"{flight}_velocity_window_rmse_summary.txt"
+    estimate.to_csv(estimate_path, index=False)
+    ground_truth.to_csv(ground_truth_path, index=False)
+    errors.to_csv(errors_path, index=False)
+    write_rmse_summary(rmse_path, metrics)
+
+    rows = len(errors)
+    actual_duration = float(errors["time"].iloc[-1] - errors["time"].iloc[0])
+    print(
+        f"Evaluated {mode} {flight}: {rows} samples, "
+        f"{actual_duration:.6f} s, RMSE_xy={metrics['rmse_xy']:.6f}, "
+        f"drift={metrics['drift_rate_mps2']:.6f} m/s^2",
+        flush=True,
+    )
+    return {
+        "mode": mode,
+        "flight": flight,
+        "label": label,
+        "window_start_s": window_start,
+        "window_end_s": window_end,
+        "rows": rows,
+        "actual_duration_s": actual_duration,
+        **metrics,
+        "out_dir": str(out_dir),
+    }
 
 
-def validate_configuration(flights, duration_s=20) -> None:
-	for group, entries in flights.items():
-		for flight, config in entries.items():
-			if not np.isfinite(float(config["start"])) or float(config["start"]) < 0:
-				raise ValueError(f"Invalid start for {group} flight_{flight}")
-			if "end" in config and not np.isclose(float(config["end"]) - float(config["start"]), duration_s):
-				raise ValueError(f"{group} flight_{flight} window is not {duration_s} seconds")
+def write_summary(path: Path, rows: Iterable[Dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=SUMMARY_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
-def selected_groups(value: str, flights) -> Tuple[str, ...]:
-	return tuple(flights) if value == "all" else (value,)
-
-
-def selected_durations(value: str) -> Tuple[int, ...]:
-	return (20,)
-
-
-def parse_arguments(bags_dir: Path, output_dir: Path, flights) -> argparse.Namespace:
-	parser = argparse.ArgumentParser(
-		description="Evaluate configured ROS bags over 20-second windows."
-	)
-	parser.add_argument("--bags_dir", default=str(bags_dir))
-	parser.add_argument("--out_dir", default=str(output_dir))
-	parser.add_argument("--group", choices=["all", *flights], default="all")
-	parser.add_argument(
-		"--duration",
-		choices=["20s"],
-		default="20s",
-	)
-	parser.add_argument("--velocity_topic", default=DEFAULT_EST_TOPIC)
-	parser.add_argument("--gt_velocity_topic", default=DEFAULT_GT_TOPIC)
-	parser.add_argument("--plot_dpi", type=int, default=300)
-	parser.add_argument("--clean_window", type=int, default=9)
-	parser.add_argument("--median_tol", type=float, default=None)
-	parser.add_argument(
-		"--bound",
-		action="append",
-		default=None,
-		help="Cleaning bound pattern:min:max; default is vel_*:-8:8",
-	)
-	parser.add_argument("--fill", choices=["none", "linear"], default="linear")
-	parser.add_argument("--savgol_window", type=int, default=21, help="Use 0 to disable smoothing")
-	parser.add_argument("--savgol_polyorder", type=int, default=2)
-	parser.add_argument("--gt_latency", type=float, default=0.025)
-	parser.add_argument("--tolerance", type=float, default=None)
-	args = parser.parse_args()
-	args.bags_dir = resolve_path(args.bags_dir)
-	args.out_dir = resolve_path(args.out_dir)
-	args.clean_window = CLEANER._normalize_window(args.clean_window)
-	args.bound_overrides = CLEANER._parse_bound_overrides(
-		args.bound or DEFAULT_VELOCITY_BOUNDS
-	)
-	if args.savgol_window <= 0:
-		args.savgol_window = None
-	return args
-
-
-def group_rollup(rows: List[Dict[str, object]], group: str) -> Dict[str, object]:
-	rollup = summarize_duration(rows)
-	return {"group": group, **rollup}
-
-
-def evaluate_dataset(
-	bags_dir: Path,
-	flights,
-	hover_analysis: bool = False,
+def evaluate_csv_group(
+    mode: str,
+    windows: Windows,
+    results_root: Path,
+    gt_root: Path,
+    run_name: str,
+    summary_filename: str,
 ) -> List[Dict[str, object]]:
-	group_name = Path(sys.argv[0]).stem[len("analyze_"):]
-	args = parse_arguments(bags_dir, REPO_ROOT / "results" / group_name, flights)
-	validate_configuration(flights)
-	groups = selected_groups(args.group, flights)
-	durations = selected_durations(args.duration)
-	results: Dict[int, List[Dict[str, object]]] = {duration: [] for duration in durations}
-	cleaning_rows: List[Dict[str, object]] = []
+    """Evaluate one mode directly from pre-cleaned, aligned source CSVs."""
+    source_dir = results_root / mode
+    gt_dir = gt_root / mode
+    output_root = source_dir / run_name
+    rows = [
+        evaluate_flight(
+            mode=mode,
+            flight=flight,
+            label=label,
+            window_start=start,
+            window_end=end,
+            est_path=source_dir / f"{flight}_velocity.csv",
+            gt_path=gt_dir / flight / "data.csv",
+            out_dir=output_root / flight,
+        )
+        for flight, (label, start, end) in windows.items()
+    ]
+    summary_path = output_root / summary_filename
+    write_summary(summary_path, rows)
+    print(f"Saved {mode} summary: {summary_path}", flush=True)
+    return rows
 
-	for group in groups:
-		for flight, config in flights[group].items():
-			flight_name = f"flight_{flight}"
-			bag_path = args.bags_dir / group / str(config["bag"])
-			if not bag_path.exists():
-				raise FileNotFoundError(f"ROS bag not found: {bag_path}")
-			print(f"Extracting {group} {flight_name}: {bag_path.name}")
 
-			extracted_dir = args.out_dir / "extracted_csv" / group
-			cleaned_dir = args.out_dir / "cleaned_csv" / group
-			est_raw = extracted_dir / f"{flight_name}_vel_est.csv"
-			gt_raw = extracted_dir / f"{flight_name}_vel_gt.csv"
-			est_rows, gt_rows, flight_time_zero = extract_bag_velocities(
-				bag_path, est_raw, gt_raw, args.velocity_topic, args.gt_velocity_topic
-			)
+def run_dataset_evaluation(
+    args: argparse.Namespace,
+    windows_by_mode: Mapping[str, Windows],
+    dataset_tag: str,
+) -> Dict[str, List[Dict[str, object]]]:
+    """Run the selected modes and write per-mode and optional combined summaries."""
+    results_root = args.results_root.resolve()
+    gt_root = args.gt_root.resolve()
+    selected_modes = list(windows_by_mode) if args.mode == "ALL" else [args.mode]
+    results: Dict[str, List[Dict[str, object]]] = {}
+    for mode in selected_modes:
+        results[mode] = evaluate_csv_group(
+            mode=mode,
+            windows=with_duration(windows_by_mode[mode], args.window_duration),
+            results_root=results_root,
+            gt_root=gt_root,
+            run_name=args.run_name,
+            summary_filename=f"{mode.lower()}_{dataset_tag}_bias_rmse_drift_summary.csv",
+        )
 
-			est_clean = cleaned_dir / f"{flight_name}_vel_est_clean.csv"
-			gt_clean = cleaned_dir / f"{flight_name}_vel_gt_clean.csv"
-			gt_aligned = cleaned_dir / f"{flight_name}_vel_gt_clean_aligned.csv"
-			est_pruned, est_filtered = clean_velocity_csv(
-				est_raw, est_clean, args.clean_window, args.median_tol, args.bound_overrides,
-				args.fill, args.savgol_window, args.savgol_polyorder,
-			)
-			gt_pruned, gt_filtered = clean_velocity_csv(
-				gt_raw, gt_clean, args.clean_window, args.median_tol, args.bound_overrides,
-				args.fill, args.savgol_window, args.savgol_polyorder,
-			)
-			align_ground_truth(est_clean, gt_clean, gt_aligned, args.gt_latency, args.tolerance)
-			cleaning_rows.append({
-				"group": group,
-				"flight": flight_name,
-				"bag": bag_path.name,
-				"estimate_extracted_rows": est_rows,
-				"gt_extracted_rows": gt_rows,
-				"estimate_bound_pruned_values": sum(est_pruned.values()),
-				"gt_bound_pruned_values": sum(gt_pruned.values()),
-				"estimate_median_filtered_values": sum(est_filtered.values()),
-				"gt_median_filtered_values": sum(gt_filtered.values()),
-			})
-
-			start_s = float(config["start"])
-			for duration_s in durations:
-				end_s = float(config.get("end", start_s + duration_s))
-				print(
-					f"Evaluating {group} {flight_name}: "
-					f"{start_s:.2f} -> {end_s:.2f} s ({duration_s}s)"
-				)
-				output_dir = args.out_dir / f"{duration_s}s" / group
-				est_window, gt_window = clip_window(
-					est_clean, gt_aligned, start_s, duration_s, output_dir, flight_name,
-					flight_time_zero,
-				)
-				row = evaluate_window(
-					est_window,
-					gt_window,
-					flight_name,
-					start_s,
-					duration_s,
-					args.plot_dpi,
-					flight_time_zero,
-					hover_analysis,
-				)
-				results[duration_s].append({"group": group, "bag": bag_path.name, **row})
-
-	args.out_dir.mkdir(parents=True, exist_ok=True)
-	pd.DataFrame(cleaning_rows).to_csv(
-		args.out_dir / f"{group_name}_velocity_cleaning_summary.csv", index=False
-	)
-	for duration_s in durations:
-		duration_dir = args.out_dir / f"{duration_s}s"
-		summary_path = duration_dir / f"{group_name}_{duration_s}s_summary_by_flight.csv"
-		group_path = duration_dir / f"{group_name}_{duration_s}s_summary_by_group.csv"
-		summary_df = pd.DataFrame(results[duration_s])
-		group_rows = [
-			group_rollup(
-				[dict(row) for row in results[duration_s] if row["group"] == group], group
-			)
-			for group in groups
-		]
-		duration_dir.mkdir(parents=True, exist_ok=True)
-		summary_df.to_csv(summary_path, index=False)
-		pd.DataFrame(group_rows).to_csv(group_path, index=False)
-		print(f"Saved {summary_path}")
-		print(f"Saved {group_path}")
-
-	return results[20]
+    if len(selected_modes) > 1:
+        combined = [row for mode in selected_modes for row in results[mode]]
+        combined_path = (
+            results_root
+            / args.run_name
+            / f"combined_{dataset_tag}_bias_rmse_drift_summary.csv"
+        )
+        write_summary(combined_path, combined)
+        print(f"Saved combined summary: {combined_path}", flush=True)
+    return results
